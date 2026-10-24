@@ -196,6 +196,7 @@ details[open]>.panel-summary::before{transform:rotate(90deg)}
       <label class="parameter"><span>文字合并间距</span><input name="width_ths" type="number" min="0.1" max="3" step="any" value="1" required></label>
       <label class="parameter"><span>小字放大倍率</span><input name="mag_ratio" type="number" min="1" max="3" step="any" value="1" required></label>
       <label class="parameter"><span>图标语义描述</span><input name="icon_caption" type="checkbox"></label>
+      <label class="parameter"><span>图标分类描述</span><input name="icon_label" type="checkbox"></label>
     </div>
   </fieldset>
   <details class="help">
@@ -207,6 +208,7 @@ details[open]>.panel-summary::before{transform:rotate(90deg)}
     <p><b>文字合并间距</b>：同一行的文字框允许隔多远还合成一个框，按文字框高度的倍数计算，不是固定像素。默认 1，范围 0.1–3。<br><b>数值小</b>（如 0.3）：文字要靠得很近才合并，不同按钮更容易分开，但一句话可能被拆成多个框。<br><b>数值大</b>（如 2）：距离更远也能合并，一句话更容易连起来，但相邻按钮可能混成一个框。例：文字框高约 20 像素时，1 允许的空隙约为 20 像素，2 约为 40 像素；还需要满足同一行等条件。</p>
     <p><b>小字放大倍率</b>：找文字区域前，把图片的宽和高各放大多少倍；不影响图标检测。默认 1，范围 1–3。<br><b>数值小</b>（1）：不额外放大，处理快，但小字可能漏掉。<br><b>数值大</b>（如 2）：宽、高各放大到原来的 2 倍，像素总量约为 4 倍，小字更容易被发现，但更慢、更占显存；不会把模糊字变清晰。大图达到内部尺寸上限后不会继续放大，输出仍是原图尺寸。</p>
     <p><b>图标语义描述</b>：默认关闭。开启后使用 OmniParser V2 的 Florence-2 模型描述没有 OCR 文字的图标；保留原始英文描述，不自动翻译。首次需要描述时加载模型，耗时会增加；之后模型保留在显存中复用，关闭开关不会卸载，退出服务才释放。描述可能误判，仅供参考。需先运行 <code>scripts/download_models.py --caption</code> 下载模型。</p>
+    <p><b>图标分类描述</b>：默认关闭。开启后用同一个 Florence-2 模型，但只让它从固定的 24 个类别里选一个（搜索、设置、关闭、文件、添加、删除、菜单、编辑、分享、下载、用户、收藏、锁定、邮件、相机、减号、箭头、勾选、警告、图片、播放、暂停、主页、返回），输出英文类别名和候选集内的相对分数。适合需要直接判断按钮用途的场合。<b>分数不是准确率</b>：它只是“在这 24 个类别里占多大比例”，换个类别表数字就会变，不能当置信度用。纯图形符号（加号、减号、箭头、展开收起）识别较差；比自由描述快，因为不等整句解码完。与“图标语义描述”不能同时开启。</p>
     <p>建议先只改一个参数：图标漏检先试降低“图标置信度”，小图标太小先试提高“图标检测尺寸”，文字漏检先试降低“文字检测阈值”，一句话被拆开再提高“文字合并间距”。改完点击“自动框选编号”比较效果。</p>
   </details>
 </details>
@@ -267,11 +269,15 @@ details[open]>.panel-summary::before{transform:rotate(90deg)}
 const file=document.querySelector('#file'),parse=document.querySelector('#parse'),copy=document.querySelector('#copy'),download=document.querySelector('#download'),status=document.querySelector('#status'),source=document.querySelector('#source'),sourceEmpty=document.querySelector('#source-empty'),result=document.querySelector('#result'),elements=document.querySelector('#elements');
 const zoom=document.querySelector('#zoom'),zoomOut=document.querySelector('#zoom-out'),zoomIn=document.querySelector('#zoom-in'),zoomReset=document.querySelector('#zoom-reset'),zoomFit=document.querySelector('#zoom-fit'),canvas=document.querySelector('#canvas');
 const parameters=document.querySelector('#parameters'),parameterControls=Array.from(parameters.querySelectorAll('[name]')),copyElements=document.querySelector('#copy-elements'),empty=document.querySelector('#empty'),emptyPick=document.querySelector('#empty-pick'),downloadJson=document.querySelector('#download-json'),dimensions=document.querySelector('#dimensions'),elementCount=document.querySelector('#element-count'),elementPanel=document.querySelector('#element-panel');
-const defaultParameters={box_threshold:0.05,iou_threshold:0.7,imgsz:1280,text_threshold:0.7,width_ths:1,mag_ratio:1,icon_caption:false};
+const defaultParameters={box_threshold:0.05,iou_threshold:0.7,imgsz:1280,text_threshold:0.7,width_ths:1,mag_ratio:1,icon_caption:false,icon_label:false};
 const typeLabels={text:'文字',icon:'图标'};
 const escapeHtml=value=>String(value).replace(/[&<>"']/g,char=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]));
 function setStatus(text,state){status.textContent=text;if(state)status.dataset.state=state;else delete status.dataset.state;}
-function applyParameters(values){for(const control of parameterControls){const value=values[control.name]??defaultParameters[control.name];if(control.type==='checkbox')control.checked=value;else control.value=value;}}
+function applyParameters(values){for(const control of parameterControls){const value=values[control.name]??defaultParameters[control.name];if(control.type==='checkbox')control.checked=value;else control.value=value;}enforceCaptionExclusive();}
+// 两个描述开关互斥，后端也会拒绝同时开启；分类描述优先保留。
+const captionToggle=parameters.querySelector('[name="icon_caption"]'),labelToggle=parameters.querySelector('[name="icon_label"]');
+function enforceCaptionExclusive(){if(labelToggle.checked&&captionToggle.checked)captionToggle.checked=false;}
+for(const toggle of [captionToggle,labelToggle])toggle.addEventListener('change',enforceCaptionExclusive);
 document.querySelector('#parameters-reset').addEventListener('click',event=>{event.preventDefault();event.stopPropagation();applyParameters(defaultParameters);});
 const historyList=document.querySelector('#history-list'),historyCount=document.querySelector('#history-count'),historyNote=document.querySelector('#history-note');
 let input='',busy=false,resultWidth=0,resultHeight=0,elementData='',activeHistoryId='',seenLatestId,historySignature=null,polling=false,viewVersion=0;
@@ -362,7 +368,7 @@ function renderResult(data){
       row.className='element-row';
       row.innerHTML='<span class="element-id">'+element.id+'</span>'
         +'<span class="element-type '+element.type+'">'+escapeHtml(typeLabels[element.type]||element.type)+'</span>'
-        +'<span class="element-content" title="'+escapeHtml(element.content||'')+'">'+escapeHtml(element.content||'（无文字）')+'</span>'
+        +'<span class="element-content" title="'+escapeHtml(element.content||'')+'">'+escapeHtml(element.content||'（无文字）')+(element.confidence===undefined?'':' <small>'+Math.round(element.confidence*100)+'%</small>')+'</span>'
         +'<code class="element-bbox">['+element.bbox.map(value=>Number(value).toFixed(3)).join(', ')+']</code>';
       fragment.append(row);
     }
@@ -384,7 +390,7 @@ parse.addEventListener('click',async()=>{
   }
   const settings=Object.fromEntries(parameterControls.map(control=>[control.name,control.type==='checkbox'?control.checked:Number(control.value)]));
   setBusy(true);viewVersion+=1;copy.disabled=true;copyElements.disabled=true;download.hidden=true;
-  setStatus(settings.icon_caption?'正在识别并生成图标描述，首次加载模型需要更长时间……':'正在识别，请稍候……','busy');
+  setStatus(settings.icon_caption||settings.icon_label?'正在识别并生成图标描述，首次加载模型需要更长时间……':'正在识别，请稍候……','busy');
   try{
     const response=await fetch('/parse/',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({image_base64:input.split(',')[1],parameters:settings})});
     const data=await response.json();

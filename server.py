@@ -62,11 +62,22 @@ PARAMETERS = {
     'mag_ratio': ('小字检测放大倍率', 1.0, 1.0, 3.0),
 }
 
+# 封闭标签集：只放下游真正需要判断的可操作元素。每个标签必须是单 token，
+# 否则首 token logits 读法无法把它们放进同一个分布比较，加载时直接报错。
+ICON_CROP_SIZE = 64
+
+ICON_LABELS = (
+    'search', 'settings', 'close', 'file', 'add', 'delete',
+    'menu', 'edit', 'share', 'download', 'user', 'star',
+    'lock', 'mail', 'camera', 'minus', 'arrow', 'check',
+    'warning', 'image', 'play', 'pause', 'home', 'back',
+)
+
 
 def validate_parameters(parameters):
     if not isinstance(parameters, dict):
         raise ValueError('parameters 必须是参数对象。')
-    if parameters.keys() - (PARAMETERS.keys() | {'icon_caption'}):
+    if parameters.keys() - (PARAMETERS.keys() | {'icon_caption', 'icon_label'}):
         raise ValueError('包含不支持的识别参数。')
     values = {}
     for name, (label, default, minimum, maximum) in PARAMETERS.items():
@@ -82,7 +93,13 @@ def validate_parameters(parameters):
     icon_caption = parameters.get('icon_caption', False)
     if type(icon_caption) is not bool:
         raise ValueError('图标语义描述必须是布尔值。')
+    icon_label = parameters.get('icon_label', False)
+    if type(icon_label) is not bool:
+        raise ValueError('图标分类描述必须是布尔值。')
+    if icon_caption and icon_label:
+        raise ValueError('图标语义描述和图标分类描述不能同时开启。')
     values['icon_caption'] = icon_caption
+    values['icon_label'] = icon_label
     return values
 
 
@@ -101,6 +118,61 @@ def get_caption_model():
             local_files_only=True, attn_implementation='eager').to('cuda').eval()
         caption_model_processor = {'model': model, 'processor': processor}
     return caption_model_processor
+
+
+def build_label_tokens(processor, labels=ICON_LABELS):
+    tokenizer = processor.tokenizer
+    entries = []
+    for label in labels:
+        plain = tokenizer.encode(label, add_special_tokens=False)
+        spaced = tokenizer.encode(' ' + label, add_special_tokens=False)
+        if len(plain) != 1 or len(spaced) != 1:
+            raise ValueError(f'封闭标签 {label!r} 不是单 token，无法用首 token 读取。')
+        entries.append((label, plain[0], spaced[0]))
+    return entries
+
+
+def classify_icons(image, boxes, entries, batch_size=16):
+    # 只解码到首个内容 token：第 0 步输出解码器起始符，第 1 步才是候选标签的分布
+    # 位置。相比自由描述最多 20 步，省掉大部分解码。
+    caption_model_processor = get_caption_model()
+    model = caption_model_processor['model']
+    processor = caption_model_processor['processor']
+    to_pil = utils.ToPILImage()
+    pixels = np.asarray(image)
+    height, width = pixels.shape[:2]
+    flat_ids = torch.tensor([token for _, plain, spaced in entries
+                             for token in (plain, spaced)], device='cuda')
+    results = []
+    with torch.inference_mode():
+        for start in range(0, len(boxes), batch_size):
+            crops = []
+            for box in boxes[start:start + batch_size]:
+                xmin = max(0, min(width - 1, int(box[0] * width)))
+                ymin = max(0, min(height - 1, int(box[1] * height)))
+                xmax = max(xmin + 1, min(width, int(box[2] * width)))
+                ymax = max(ymin + 1, min(height, int(box[3] * height)))
+                crop = pixels[ymin:ymax, xmin:xmax, :]
+                # 与上游描述流程一致：统一到 64×64，否则不同尺寸的裁剪无法组成一个批次。
+                crop = utils.cv2.resize(np.ascontiguousarray(crop), (ICON_CROP_SIZE, ICON_CROP_SIZE))
+                crops.append(to_pil(crop))
+            inputs = processor(images=crops, text=['<CAPTION>'] * len(crops),
+                               return_tensors='pt', do_resize=False)
+            inputs = inputs.to(device='cuda', dtype=torch.float16)
+            generated = model.generate(
+                input_ids=inputs['input_ids'], pixel_values=inputs['pixel_values'],
+                max_new_tokens=3, num_beams=1, do_sample=False,
+                output_scores=True, return_dict_in_generate=True)
+            # max_new_tokens=2 时序列刚够两个位置就会被当成已结束，scores[1] 全是
+            # 遮蔽值；3 才能稳定拿到首个内容 token 的分布。
+            logits = generated.scores[1].float()
+            scores = logits[:, flat_ids].reshape(len(crops), len(entries), 2).max(dim=2).values
+            weights = torch.softmax(scores, dim=-1)
+            for index in range(len(crops)):
+                best = int(scores[index].argmax())
+                # 候选集内 softmax 只是相对参考，不是校准后的置信度。
+                results.append((entries[best][0], round(float(weights[index, best]), 3)))
+    return results
 
 
 def parse_image(encoded, parameters):
@@ -139,6 +211,16 @@ def parse_image(encoded, parameters):
                 for element, caption in zip(icons, captions, strict=True):
                     element['content'] = caption
                     element['source'] = 'box_yolo_content_caption'
+        if parameters['icon_label']:
+            icons = [element for element in elements
+                     if element['type'] == 'icon' and element['content'] is None]
+            if icons:
+                entries = build_label_tokens(get_caption_model()['processor'])
+                labeled = classify_icons(image, [element['bbox'] for element in icons], entries)
+                for element, (label, score) in zip(icons, labeled, strict=True):
+                    element['content'] = label
+                    element['confidence'] = score
+                    element['source'] = 'box_yolo_content_label'
         for index, element in enumerate(elements, start=1):
             element['id'] = index
         created = datetime.now().astimezone()

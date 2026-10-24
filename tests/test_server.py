@@ -14,6 +14,10 @@ URL = 'http://127.0.0.1:17897'
 session = requests.Session()
 session.trust_env = False
 
+import sys
+sys.path.insert(0, str(ROOT))
+import server
+
 
 def encode(image):
     stream = io.BytesIO()
@@ -109,7 +113,8 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(result['elements'], [])
         self.assertEqual(result['parameters'], {
             'box_threshold': 0.05, 'iou_threshold': 0.7, 'imgsz': 1280,
-            'text_threshold': 0.7, 'width_ths': 1.0, 'mag_ratio': 1.0, 'icon_caption': False,
+            'text_threshold': 0.7, 'width_ths': 1.0, 'mag_ratio': 1.0,
+            'icon_caption': False, 'icon_label': False,
         })
 
     def test_custom_parameters(self):
@@ -120,7 +125,8 @@ class ServerTests(unittest.TestCase):
         parameters = {'box_threshold': 0.2, 'iou_threshold': 0.5, 'imgsz': 640,
                       'text_threshold': 0.6, 'width_ths': 1.5, 'mag_ratio': 1.5}
         result = self.parse(image, parameters)
-        self.assertEqual(result['parameters'], parameters | {'icon_caption': False})
+        self.assertEqual(result['parameters'], parameters | {'icon_caption': False,
+                                                              'icon_label': False})
         self.assertTrue(any('截图' in (element['content'] or '')
                             for element in result['elements']))
 
@@ -131,7 +137,9 @@ class ServerTests(unittest.TestCase):
                            {'text_threshold': '0.7'}, {'width_ths': True},
                            {'width_ths': -1}, {'mag_ratio': 4},
                            {'icon_caption': 1}, {'icon_caption': 'true'},
-                           {'icon_caption': None}):
+                           {'icon_caption': None}, {'icon_label': 1},
+                           {'icon_label': 'true'}, {'icon_label': None},
+                           {'icon_caption': True, 'icon_label': True}):
             with self.subTest(parameters=parameters):
                 response = session.post(URL + '/parse/',
                                         json={'image_base64': encoded, 'parameters': parameters},
@@ -201,6 +209,71 @@ class ServerTests(unittest.TestCase):
         restored = self.parse(image, {'icon_caption': False})
         self.assertEqual(restored['elements'], disabled['elements'])
         print('图标描述：', [element['content'] for element in captions])
+
+    def test_icon_label(self):
+        image = Image.new('RGB', (320, 240), 'white')
+        draw = ImageDraw.Draw(image)
+        draw.rounded_rectangle((60, 60, 120, 120), radius=8, fill='#eeeeee', outline='black', width=2)
+        draw.line((75, 75, 105, 105), fill='black', width=4)
+        draw.line((75, 105, 105, 75), fill='black', width=4)
+        disabled = self.parse(image)
+        icons = [element for element in disabled['elements']
+                 if element['type'] == 'icon' and element['content'] is None]
+        self.assertTrue(icons)
+        enabled = self.parse(image, {'icon_label': True})
+        self.assertTrue(enabled['parameters']['icon_label'])
+        self.assertFalse(enabled['parameters']['icon_caption'])
+        self.assertEqual([element['bbox'] for element in enabled['elements']],
+                         [element['bbox'] for element in disabled['elements']])
+        labels = [element for element in enabled['elements']
+                  if element.get('source') == 'box_yolo_content_label']
+        self.assertEqual(len(labels), len(icons))
+        for element in labels:
+            self.assertIn(element['content'], server.ICON_LABELS)
+            self.assertGreaterEqual(element['confidence'], 0)
+            self.assertLessEqual(element['confidence'], 1)
+        repeated = self.parse(image, {'icon_label': True})
+        self.assertEqual([element['content'] for element in repeated['elements']],
+                         [element['content'] for element in enabled['elements']])
+        restored = self.parse(image)
+        self.assertEqual(restored['elements'], disabled['elements'])
+        print('图标分类：', [(element['content'], element['confidence']) for element in labels])
+
+    def test_icon_label_requires_single_token(self):
+        import sys
+
+        sys.path.insert(0, str(ROOT / 'third_party/omniparser'))
+        from util import utils
+
+        processor = server.get_caption_model()['processor']
+        entries = server.build_label_tokens(processor)
+        self.assertEqual([entry[0] for entry in entries], list(server.ICON_LABELS))
+        self.assertTrue(all(entry[1] != entry[2] for entry in entries))
+        # trash 在 Florence-2 词表里被切成两个 token，必须被拒绝而不是静默降级。
+        with self.assertRaises(ValueError):
+            server.build_label_tokens(processor, ('trash',))
+        self.assertIsNotNone(utils.ToPILImage)
+
+    def test_icon_label_varied_crop_sizes(self):
+        # 真实截图里图标框尺寸差异很大，批量推理前必须统一裁剪尺寸。
+        # 用现场生成的图片，避免依赖未纳入 Git 的参考截图。
+        image = Image.new('RGB', (400, 300), 'white')
+        draw = ImageDraw.Draw(image)
+        for index, (left, top, size) in enumerate(((20, 20, 24), (120, 60, 64), (260, 180, 40))):
+            draw.rounded_rectangle((left, top, left + size, top + size),
+                                   radius=6, outline='black', width=3)
+            draw.line((left + 6, top + size // 2, left + size - 6, top + size // 2),
+                      fill='black', width=3)
+        entries = server.build_label_tokens(server.get_caption_model()['processor'])
+        width, height = image.size
+        boxes = [[20 / width, 20 / height, 44 / width, 44 / height],
+                 [120 / width, 60 / height, 184 / width, 124 / height],
+                 [260 / width, 180 / height, 300 / width, 220 / height]]
+        labels = server.classify_icons(image, boxes, entries)
+        self.assertEqual(len(labels), len(boxes))
+        for name, confidence in labels:
+            self.assertIn(name, server.ICON_LABELS)
+            self.assertTrue(0 <= confidence <= 1)
 
     def test_caption_empty_and_text_only(self):
         import sys

@@ -4,9 +4,9 @@
 
 A local screenshot parsing Web UI based on Microsoft OmniParser, designed for Windows and NVIDIA GPUs. The frontend uses plain HTML/CSS/JavaScript, and the backend uses Python's standard-library HTTP server. No Node.js or frontend build tools are required.
 
-Current features include icon detection, Chinese and English OCR, optional icon captioning, element numbering starting at 1, adjustable inference parameters, image zoom, image and JSON export, and history restoration. The Windows system tray launcher also provides full-screen capture, region capture, and clipboard image processing.
+Current features include icon detection, Chinese and English OCR, optional icon captioning, optional closed-set icon classification, element numbering starting at 1, adjustable inference parameters, image zoom, image and JSON export, and history restoration. The Windows system tray launcher also provides full-screen capture, region capture, and clipboard image processing.
 
-Optional OmniParser V2 Florence-2 icon captioning is supported and disabled by default. The detector uses the upstream YOLOv9-E implementation (`icon_detect_v3`), rather than directly reproducing the complete official inference configuration.
+Optional OmniParser V2 Florence-2 icon captioning is supported and disabled by default; a closed-set icon classification mode using the same model is also available, disabled by default, and the two cannot be enabled together. The detector uses the upstream YOLOv9-E implementation (`icon_detect_v3`), rather than directly reproducing the complete official inference configuration.
 
 ## Environment and Installation
 
@@ -105,6 +105,31 @@ The model loads only when an enabled request contains icons requiring captions. 
 
 The model directory contains pinned Florence-2 Python architecture code. Loading uses `trust_remote_code=True` but reads downloaded local files only. Do not replace these files with material from untrusted sources.
 
+## Closed-Set Icon Classification (Optional)
+
+Reuses the same Florence-2 weights, but instead of writing a free-form sentence the model must pick one of 24 fixed labels, returning the label name and a score relative to that candidate set. This suits cases where downstream code needs to decide what a button does.
+
+The labels are fixed: `search`, `settings`, `close`, `file`, `add`, `delete`, `menu`, `edit`, `share`, `download`, `user`, `star`, `lock`, `mail`, `camera`, `minus`, `arrow`, `check`, `warning`, `image`, `play`, `pause`, `home`, `back`.
+
+When enabled, only icons without OCR text are classified. The label goes into `content`, `source` becomes `box_yolo_content_label`, and an extra `confidence` field is written:
+
+```json
+{"id": 61, "type": "icon", "content": "settings", "confidence": 0.204,
+ "source": "box_yolo_content_label", "bbox": [0.814, 0.073, 0.833, 0.088]}
+```
+
+It decodes only up to the first content token and reads the distribution there, so it is faster than free-form captioning (up to 20 tokens), while the initial model load costs the same. The label list is `ICON_LABELS` in `server.py`. **Every label must be a single token in the Florence-2 vocabulary**; otherwise the request fails instead of silently degrading. For example, `trash` splits into two tokens and cannot be added.
+
+**`confidence` is not an accuracy figure.** It is only the softmax share among the 24 candidates; changing the label list changes the number, and no temperature calibration has been done. It is usable for relative ordering, not as "this decision is X% likely correct" for thresholding.
+
+Measured limitations:
+
+- Semantic icons (close, settings, search, checkbox, user avatar) usually match; purely graphical symbols (plus, minus, arrows, expand/collapse) are often wrong — downscaling icons to 64×64 loses stroke detail, and Florence-2-base has no good representation for abstract symbols.
+- Mutually exclusive with icon captioning; enabling both is rejected, and the web UI clears the other checkbox automatically.
+- Fewer labels means less distortion from renormalising inside the candidate set; trim the list to the dozen or so labels downstream actually uses if needed.
+
+Using `confidence` as a real probability requires calibration: build a labelled set of a few hundred of your own icon crops, fit a temperature parameter so predictions match empirical accuracy, then set thresholds by quantile. That calibration is not implemented.
+
 ### Local Performance Measurements
 
 Verified on an RTX 5070 Ti 16GB with Python 3.12.10 and PyTorch 2.8.0 + CUDA 12.8:
@@ -115,8 +140,9 @@ Verified on an RTX 5070 Ti 16GB with Python 3.12.10 and PyTorch 2.8.0 + CUDA 12.
 | Subsequent caption for the same icon | 0.49 seconds |
 | 1234 × 1234 reference screenshot, captioning disabled | 2.01 seconds |
 | Same screenshot, captioning 8 icons with the model already loaded | 3.04–3.25 seconds |
+| Same screenshot, classifying 8 icons with the model already loaded | 2.96 seconds |
 
-FP16 caption model weights alone use approximately 453 MiB of GPU memory, excluding the detector, OCR, temporary inference memory, and PyTorch caches. These are individual local measurements, not performance guarantees. Latency and memory requirements vary with image size, icon count, and GPU environment. Captions for very small icons, false detections, or icons lacking context are particularly prone to inaccuracies.
+FP16 caption model weights alone use approximately 453 MiB of GPU memory, excluding the detector, OCR, temporary inference memory, and PyTorch caches. These are individual local measurements, not performance guarantees. Latency and memory requirements vary with image size, icon count, and GPU environment. Captions for very small icons, false detections, or icons lacking context are particularly prone to inaccuracies. Classification skips most decoding steps, but on a single screenshot detection and OCR dominate the total, so end-to-end times differ little.
 
 ## Launch and Usage
 
@@ -164,14 +190,14 @@ local/archive/              Original upstream repository and old page (excluded 
 
 ## Tests
 
-The full suite includes real icon caption inference. First install the dependencies in `requirements.txt`, then run `scripts/download_models.py --caption` or prepare all models and local configuration using the manual download instructions. Start the inference server, then run the following in another PowerShell window:
+The full suite includes real icon caption and classification inference. First install the dependencies in `requirements.txt`, then run `scripts/download_models.py --caption` or prepare all models and local configuration using the manual download instructions. Start the inference server, then run the following in another PowerShell window:
 
 ```powershell
 .\.venv\Scripts\python.exe -m unittest discover -s tests -v
 powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File tests\test_startup.ps1
 ```
 
-All 18 Python tests passed during verification, covering captioning on/off, crop-to-caption alignment, blank and text-only images, history persistence, parameter validation, and local access restrictions. Fully offline model and processor loading was also verified, along with caption display, history restoration, and resetting defaults in the browser.
+All 21 Python tests passed during verification, covering captioning on/off, closed-set classification, crop-to-caption alignment, blank and text-only images, history persistence, parameter validation, and local access restrictions. Fully offline model and processor loading was also verified, along with caption display, history restoration, and resetting defaults in the browser.
 
 API tests require a GPU and generate local history records. Chinese OCR tests use the Microsoft YaHei font on Windows. The original reference screenshot is retained at `tests/fixtures/reference.png` but excluded from Git to avoid publishing a personal screenshot. The reference screenshot test is skipped when that file is missing; the remaining tests use generated images.
 
